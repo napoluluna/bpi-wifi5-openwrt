@@ -1,0 +1,28 @@
+diff --git a/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts b/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
+index 84c5c37..a244ec3 100644
+--- a/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
++++ b/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
+@@ -232,7 +232,22 @@
+ 	nvmem-cell-names = "mac-address", "rgmii-delay";
+ 
+ 	status = "okay";
+-	phy-mode = "rgmii-id";
++	/* SoC programs the RGMII delay itself from the factory value at
++	 * 0xb2; adding the MAC's internal delay on top would double it.
++	 * The switch CPU port is plain "rgmii" - match it.
++	 */
++	phy-mode = "rgmii";
++
++	/* NOTE: stmmac_platform.c reads these WITHOUT the "snps," prefix:
++	 *   of_property_read_u32(np, "tx-fifo-depth", &plat->tx_fifo_size);
++	 * Without them plat->tx_fifo_size stays 0, stmmac_change_mtu() falls
++	 * back to dma_cap.tx_fifo_size and then fails "txfifosz < new_mtu"
++	 * for EVERY value, including ones below the current MTU. DSA can then
++	 * never reserve its 4 tag bytes on the conduit, so tagged frames from
++	 * the switch are dropped before any counter sees them.
++	 */
++	tx-fifo-depth = <4096>;
++	rx-fifo-depth = <4096>;
+ 	snps,ps-speed = <1000>;
+ 	fixed-link {
+ 		speed = <1000>;

@@ -1,0 +1,58 @@
+diff --git a/target/linux/generic/files-6.18/drivers/net/dsa/an8855.c b/target/linux/generic/files-6.18/drivers/net/dsa/an8855.c
+index 0a39368..321ca9b 100644
+--- a/target/linux/generic/files-6.18/drivers/net/dsa/an8855.c
++++ b/target/linux/generic/files-6.18/drivers/net/dsa/an8855.c
+@@ -1565,7 +1565,8 @@ static void an8855_phylink_mac_link_up(struct phylink_config *config,
+ 	int port = dp->index;
+ 	u32 reg;
+ 
+-	reg = regmap_read(priv->regmap, AN8855_PMCR_P(port), &reg);
++	if (regmap_read(priv->regmap, AN8855_PMCR_P(port), &reg))
++		return;
+ 	if (phylink_autoneg_inband(mode)) {
+ 		reg &= ~AN8855_PMCR_FORCE_MODE;
+ 	} else {
+@@ -1610,6 +1611,28 @@ static void an8855_phylink_mac_link_up(struct phylink_config *config,
+ 	reg |= AN8855_PMCR_TX_EN | AN8855_PMCR_RX_EN;
+ 
+ 	regmap_write(priv->regmap, AN8855_PMCR_P(port), reg);
++
++	/* Port 5 in RGMII mode additionally needs its MAC sideband forced to
++	 * the link speed. Leaving this at its reset value of 0 leaves the
++	 * RGMII link electrically up and reporting the negotiated speed on
++	 * both sides while no frame ever crosses it, in either direction,
++	 * with no error counted anywhere. The vendor SDK does the same in
++	 * air_port_setRgmiiMode().
++	 */
++	if (port == 5 && phy_interface_mode_is_rgmii(interface)) {
++		switch (speed) {
++		case SPEED_1000:
++			reg = AN8855_FORCE_MAC5_SB_1000;
++			break;
++		case SPEED_100:
++			reg = AN8855_FORCE_MAC5_SB_100;
++			break;
++		default:
++			reg = AN8855_FORCE_MAC5_SB_10;
++			break;
++		}
++		regmap_write(priv->regmap, AN8855_RG_FORCE_MAC5_SB, reg);
++	}
+ }
+ 
+ static unsigned int an8855_pcs_inband_caps(struct phylink_pcs *pcs,
+diff --git a/target/linux/generic/files-6.18/drivers/net/dsa/an8855.h b/target/linux/generic/files-6.18/drivers/net/dsa/an8855.h
+index 2462b9d..aff51ac 100644
+--- a/target/linux/generic/files-6.18/drivers/net/dsa/an8855.h
++++ b/target/linux/generic/files-6.18/drivers/net/dsa/an8855.h
+@@ -735,6 +735,10 @@ enum an8855_vlan_port_acc_frm {
+ #define   AN8855_RG_QP_PLL_SSC_TRI_EN	BIT(3)
+ 
+ /*	AN8855_ETHER_SYS_BASE		0x1028c800 */
++#define AN8855_RG_FORCE_MAC5_SB		0x1028c82c
++#define   AN8855_FORCE_MAC5_SB_1000	0x00020101
++#define   AN8855_FORCE_MAC5_SB_100	0x00010101
++#define   AN8855_FORCE_MAC5_SB_10	0x00000101
+ #define AN8855_RG_GPHY_AFE_PWD		0x1028c840
+ #define AN8855_RG_GPHY_SMI_ADDR		0x1028c848
+ 

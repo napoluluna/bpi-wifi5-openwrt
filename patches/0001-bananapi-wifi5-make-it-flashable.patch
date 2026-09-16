@@ -1,0 +1,159 @@
+diff --git a/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts b/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
+index df7e3d2..84c5c37 100644
+--- a/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
++++ b/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
+@@ -7,13 +7,21 @@
+ 	model = "Bananapi Wifi5";
+ 	compatible = "bananapi,wifi5", "siflower,sf19a2890";
+ 
++	aliases {
++		led-boot = &led_wlan;
++		led-failsafe = &led_wlan;
++		led-running = &led_wlan;
++		led-upgrade = &led_wlan;
++		label-mac-device = &gmac;
++	};
++
+ 	chosen {
+ 		stdout-path = "serial0:115200n8";
+ 	};
+ 
+ 	memory@0 {
+ 		device_type = "memory";
+-		reg = <0x0 0x8000000>;
++		reg = <0x0 0x4000000>; /* 64 MiB, confirmed on BPI-WiFi5 */
+ 	};
+ 
+ 	leds {
+@@ -220,8 +228,8 @@
+ };
+ 
+ &gmac {
+-	nvmem-cells = <&macaddr_factory_0 1>;
+-	nvmem-cell-names = "mac-address";
++	nvmem-cells = <&macaddr_factory_0 0>, <&rgmii_delay_factory_b2>;
++	nvmem-cell-names = "mac-address", "rgmii-delay";
+ 
+ 	status = "okay";
+ 	phy-mode = "rgmii-id";
+@@ -316,12 +324,21 @@ get gmac delay: 0X31 0X32 0X30 0X34
+ 							reg = <0x0 0x6>;
+ 							#nvmem-cell-cells = <1>;
+ 						};
++
++						/* RGMII TX/RX delay calibration, 4 ASCII
++						 * digits. Vendor DT reads this as
++						 * mtd-gmac-delay = <&factory 178>.
++						 */
++						rgmii_delay_factory_b2: rgmii-delay@b2 {
++							reg = <0xb2 0x4>;
++						};
+ 					};
+ 				};
+ 
+ 			partition@a0000 {
++				compatible = "denx,uimage";
+ 				label = "firmware";
+-				reg = <0xa0000 0x760000>;
++				reg = <0xa0000 0x760000>; /* 8 MiB NOR; see README */
+ 			};
+ 
+ 		};
+diff --git a/target/linux/siflower/files-6.18/drivers/net/ethernet/stmicro/stmmac/dwmac-sf19a2890.c b/target/linux/siflower/files-6.18/drivers/net/ethernet/stmicro/stmmac/dwmac-sf19a2890.c
+index b6b021f..5d86db6 100644
+--- a/target/linux/siflower/files-6.18/drivers/net/ethernet/stmicro/stmmac/dwmac-sf19a2890.c
++++ b/target/linux/siflower/files-6.18/drivers/net/ethernet/stmicro/stmmac/dwmac-sf19a2890.c
+@@ -47,6 +47,7 @@ static int sfgmac_set_delay_from_nvmem(struct sf19a2890_gmac_priv *priv)
+ 	size_t retlen;
+ 	u16 gmac_delay;
+ 	u8 delay_tx, delay_rx;
++	char delay_str[SFGMAC_DELAY_STR_LEN + 1];
+ 
+ 	cell = of_nvmem_cell_get(np, "rgmii-delay");
+ 	if (IS_ERR(cell))
+@@ -59,11 +60,20 @@ static int sfgmac_set_delay_from_nvmem(struct sf19a2890_gmac_priv *priv)
+ 		return PTR_ERR(data);
+ 
+ 	if (retlen < SFGMAC_DELAY_STR_LEN) {
++		dev_warn(priv->dev, "rgmii-delay cell too short (%zu bytes)\n",
++			 retlen);
+ 		ret = -EINVAL;
+ 		goto exit;
+ 	}
+ 
+-	ret = kstrtou16(data, 16, &gmac_delay);
++	/* The cell is exactly 4 raw ASCII hex digits with no terminator, so
++	 * it cannot be handed to kstrtou16() directly - that would parse off
++	 * the end of the buffer. Copy into a NUL-terminated string first.
++	 */
++	memcpy(delay_str, data, SFGMAC_DELAY_STR_LEN);
++	delay_str[SFGMAC_DELAY_STR_LEN] = '\0';
++
++	ret = kstrtou16(delay_str, 16, &gmac_delay);
+ 	if (ret == 0) {
+ 		delay_tx = (gmac_delay >> 8) & 0xff;
+ 		delay_rx = gmac_delay & 0xff;
+@@ -71,6 +81,12 @@ static int sfgmac_set_delay_from_nvmem(struct sf19a2890_gmac_priv *priv)
+ 		writel(delay_rx, priv->gmac_cfg + REG_CLK_RX_PHY_DELAY);
+ 		if (delay_rx)
+ 			writel(1, priv->gmac_cfg + REG_CLK_RX_PHY_DELAY_EN);
++		dev_info(priv->dev,
++			 "rgmii delay from nvmem: \"%s\" -> tx=0x%02x rx=0x%02x\n",
++			 delay_str, delay_tx, delay_rx);
++	} else {
++		dev_warn(priv->dev, "cannot parse rgmii-delay \"%s\": %d\n",
++			 delay_str, ret);
+ 	}
+ 
+ exit:
+@@ -136,6 +152,10 @@ static int sf19a2890_gmac_probe(struct platform_device *pdev)
+ 	ret = sfgmac_set_delay_from_nvmem(priv);
+ 	if (ret == -EPROBE_DEFER)
+ 		return -EPROBE_DEFER;
++	if (ret)
++		dev_warn(&pdev->dev,
++			 "no rgmii delay applied (%d); link may come up but pass no traffic\n",
++			 ret);
+ 
+ 	ret = sfgmac_setup_phy_interface(priv);
+ 	if (ret)
+diff --git a/target/linux/siflower/image/sf19a2890.mk b/target/linux/siflower/image/sf19a2890.mk
+index e237e8a..f6407ad 100644
+--- a/target/linux/siflower/image/sf19a2890.mk
++++ b/target/linux/siflower/image/sf19a2890.mk
+@@ -26,6 +26,9 @@ define Device/bananapi_wifi5
+   DEVICE_MODEL := Wifi5
+   BOARD_NAME := bananapi,wifi5
+   DEVICE_DTS := sf19a2890_bananapi-wifi5
++  IMAGE_SIZE := 7552k
++  IMAGE/sysupgrade.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | \
++	append-rootfs | pad-rootfs | check-size | append-metadata
+ endef
+ TARGET_DEVICES += bananapi_wifi5
+ 
+diff --git a/target/linux/siflower/sf19a2890/base-files/etc/board.d/02_network b/target/linux/siflower/sf19a2890/base-files/etc/board.d/02_network
+index f3da214..fb4c514 100644
+--- a/target/linux/siflower/sf19a2890/base-files/etc/board.d/02_network
++++ b/target/linux/siflower/sf19a2890/base-files/etc/board.d/02_network
+@@ -8,6 +8,9 @@ siflower_setup_interfaces()
+ 	local board="$1"
+ 
+ 	case $board in
++	bananapi,wifi5)
++		ucidef_set_interfaces_lan_wan "lan2 lan3 lan4" "wan"
++		;;
+ 	siflower,sf19a2890-evb)
+ 		ucidef_add_switch "switch0" \
+ 			"0:wan" "1:lan" "2:lan" "3:lan" "4:lan" "6@eth0"
+@@ -23,6 +26,11 @@ siflower_setup_macs()
+ 	local label_mac=""
+ 
+ 	case $board in
++	bananapi,wifi5)
++		label_mac=$(mtd_get_mac_binary factory 0x0)
++		lan_mac=$label_mac
++		wan_mac=$(macaddr_add "$label_mac" 9)
++		;;
+ 	siflower,sf19a2890-evb)
+ 		wan_mac=$(macaddr_add "$(mtd_get_mac_binary factory 0x0)" 1)
+ 		;;
