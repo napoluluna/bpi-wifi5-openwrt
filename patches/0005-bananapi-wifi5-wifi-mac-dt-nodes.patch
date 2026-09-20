@@ -1,0 +1,137 @@
+bananapi-wifi5: add the WiFi MAC device tree nodes
+
+The mainline dtsi models the RF front end (wlan_rf), the per-band reset
+controllers (wlan24rst, wlan5rst) and their periph clocks, but has no nodes for
+the two WiFi MACs themselves, so the siwifi driver has nothing to bind to.
+
+reg, interrupts and clock-names are taken from the vendor DTS (1806_SDK,
+arch/mips/boot/dts/siflower/sf19a28_fullmask.dtsi). The clock phandles are the
+mainline equivalents, confirmed by register address: the muxdiv block is at the
+clock-controller base + 0x400, so CLK_MUXDIV_BUS2 (0x20) is the vendor's
+bus2xnclk at 0x19e01420, CLK_MUXDIV_M6250_0 (0x280) its m_SFDSP0clk at
+0x19e01680, and so on.
+
+Each node also takes its own periph gate clocks (axis, axim, plf) and reset,
+which is what the vendor's release_reset() drove by hand.
+
+The MAC address comes from the same factory nvmem cell as gmac; the driver
+applies its own per-band offset.
+
+diff --git a/target/linux/siflower/dts/sf19a2890.dtsi b/target/linux/siflower/dts/sf19a2890.dtsi
+index eaf4fce489..bb193b0787 100644
+--- a/target/linux/siflower/dts/sf19a2890.dtsi
++++ b/target/linux/siflower/dts/sf19a2890.dtsi
+@@ -126,7 +126,11 @@
+ 		wlan_rf: phy@11c00000{
+ 			compatible = "siflower,sf19a2890-rf";
+ 			reg = <0x11c00000 0x600000>;
+-			interrupts = <GIC_SHARED 187 IRQ_TYPE_LEVEL_HIGH>;
++			/* The vendor DTS says LEVEL_HIGH, but the vendor rf driver
++			 * requests it with IRQF_TRIGGER_LOW, which wins; LOW is what
++			 * has always run. Declaring it here lets the driver stop
++			 * overriding the type, which is what made it un-reloadable. */
++			interrupts = <GIC_SHARED 187 IRQ_TYPE_LEVEL_LOW>;
+ 			clocks = <&rfclk 1>, <&rfclk 2>, <&rfclk 3>;
+ 			clock-names = "axi", "boot", "lp";
+ 			resets = <&rfrst 0>;
+@@ -135,6 +139,67 @@
+ 			status = "disabled";
+ 		};
+ 
++		/*
++		 * The two WiFi MACs. reg, interrupts and clock-names come from
++		 * the vendor DTS (1806_SDK, arch/mips/boot/dts/siflower/
++		 * sf19a28_fullmask.dtsi, nodes wifi-lb@11000000 / wifi-hb@
++		 * 17800000). The clock phandles are the mainline equivalents of
++		 * the vendor's, confirmed by register address rather than by
++		 * name - the muxdiv block sits at this node's base + 0x400, so
++		 *   CLK_MUXDIV_BUS2        0x20  -> 0x19e01420 = bus2xnclk
++		 *   CLK_MUXDIV_BUS3        0x40  -> 0x19e01440 = bus3xnclk
++		 *   CLK_MUXDIV_M6250_0    0x280  -> 0x19e01680 = m_SFDSP0clk
++		 *   CLK_MUXDIV_M6250_1    0x2a0  -> 0x19e016a0 = m_SFDSP1clk
++		 *   CLK_MUXDIV_WLAN24_PLF 0x2c0  -> 0x19e016c0 = wlan24clk
++		 *   CLK_MUXDIV_WLAN5_PLF  0x2e0  -> 0x19e016e0 = wlan5clk
++		 * Each band wants its own platform and bus clock plus the other
++		 * band's, because either MAC can drive the shared LMAC RAM.
++		 *
++		 * The MAC address is the same factory cell gmac uses; the driver
++		 * adds its own per-band offset (+2 low band, +6 high band) in
++		 * siwifi_main.c, which is what the vendor's
++		 * mtd-mac-address = <&factory 0> did on both nodes.
++		 */
++		wifi_lb: wifi@11000000 {
++			compatible = "siflower,sf16a18-wifi-lb";
++			reg = <0x11000000 0x400000>;
++			interrupts = <GIC_SHARED 90 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SHARED 89 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SHARED 115 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk CLK_MUXDIV_WLAN24_PLF>,
++				 <&clk CLK_MUXDIV_BUS2>,
++				 <&clk CLK_MUXDIV_M6250_0>,
++				 <&clk CLK_MUXDIV_WLAN5_PLF>,
++				 <&clk CLK_MUXDIV_BUS3>,
++				 <&wlan24clk 0>, <&wlan24clk 1>, <&wlan24clk 2>;
++			clock-names = "wlan_clk", "bus2_clk", "m_SFDSPclk",
++				      "wlan5_clk", "bus3_clk",
++				      "mac_axis", "mac_axim", "mac_plf";
++			resets = <&wlan24rst 0>;
++			reset-names = "wifi";
++			status = "disabled";
++		};
++
++		wifi_hb: wifi@17800000 {
++			compatible = "siflower,sf16a18-wifi-hb";
++			reg = <0x17800000 0x400000>;
++			interrupts = <GIC_SHARED 186 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SHARED 185 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SHARED 115 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&clk CLK_MUXDIV_WLAN5_PLF>,
++				 <&clk CLK_MUXDIV_BUS3>,
++				 <&clk CLK_MUXDIV_M6250_1>,
++				 <&clk CLK_MUXDIV_WLAN24_PLF>,
++				 <&clk CLK_MUXDIV_BUS2>,
++				 <&wlan5clk 0>, <&wlan5clk 1>, <&wlan5clk 2>;
++			clock-names = "wlan_clk", "bus3_clk", "m_SFDSPclk",
++				      "wlan24_clk", "bus2_clk",
++				      "mac_axis", "mac_axim", "mac_plf";
++			resets = <&wlan5rst 0>;
++			reset-names = "wifi";
++			status = "disabled";
++		};
++
+ 		usb: usb@17000000 {
+ 			compatible = "siflower,sf19a2890-usb";
+ 			reg = <0x17000000 0x40000>;
+diff --git a/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts b/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
+index a244ec39a9..ba03e2b595 100644
+--- a/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
++++ b/target/linux/siflower/dts/sf19a2890_bananapi-wifi5.dts
+@@ -258,6 +258,28 @@
+ 
+ &wlan_rf {
+ 	status = "okay";
++	/* The board has external front-end modules (PA + LNA) on both bands;
++	 * the vendor BPI DTS forces them on the same way. Without this the RF
++	 * driver never configures them and 5 GHz runs ~35 dB down both ways. */
++	force_expa = <1>;
++	/* per-unit calibration table in the factory partition is the
++	 * dual-antenna ("V4") format; the vendor BPI DTS sets this too */
++	dual-antenna-calibrate = <1>;
++};
++
++/* Both radios take the same factory MAC as gmac; the driver applies its own
++ * per-band offset. Same cell, same <&macaddr_factory_0 0> argument.
++ */
++&wifi_lb {
++	nvmem-cells = <&macaddr_factory_0 0>;
++	nvmem-cell-names = "mac-address";
++	status = "okay";
++};
++
++&wifi_hb {
++	nvmem-cells = <&macaddr_factory_0 0>;
++	nvmem-cell-names = "mac-address";
++	status = "okay";
+ };
+ 
+ &uart0 {

@@ -1,0 +1,24 @@
+bananapi-wifi5: lower vm.min_free_kbytes to 2 MB
+
+OpenWrt's /etc/init.d/sysctl sets vm.min_free_kbytes=8192 for anything over
+32 MiB of RAM. On this board the WiFi driver holds ~14 MB, and with LuCI and
+both radios up MemAvailable idled at ~2.5 MB while MemFree was 10 MB: the
+kernel was protecting an 8 MB reserve and invoking the OOM killer instead
+(hostapd, netifd, rpcd and the test iperf3 were killed under a 4-stream
+transfer, which restarted the radios). A sysctl.d file is applied after the
+init script's default. Measured: 2 MB gives MemAvailable 12.3 MB and the same
+transfer runs with no kill.
+
+diff --git a/target/linux/siflower/base-files/etc/sysctl.d/11-bpi-wifi5-lowmem.conf b/target/linux/siflower/base-files/etc/sysctl.d/11-bpi-wifi5-lowmem.conf
+new file mode 100644
+--- /dev/null
++++ b/target/linux/siflower/base-files/etc/sysctl.d/11-bpi-wifi5-lowmem.conf
+@@ -0,0 +1,8 @@
++# Banana Pi BPI-WiFi5: 64 MiB RAM of which the WiFi driver holds ~14 MB.
++# OpenWrt's /etc/init.d/sysctl picks vm.min_free_kbytes=8192 for any box with
++# more than 32 MiB, i.e. it keeps the last 8 MB out of reach of everything and
++# lets the OOM killer loose instead - with LuCI and both radios up that left
++# MemAvailable at ~2.5 MB and a 4-stream iperf3 got hostapd, netifd and rpcd
++# killed. Files in sysctl.d are applied after that default. 2 MB measured:
++# MemAvailable 2.6 -> 12.3 MB, no kills under the same load.
++vm.min_free_kbytes=2048

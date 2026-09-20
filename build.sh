@@ -7,7 +7,10 @@
 #
 # Usage:
 #   ./build.sh                  # initramfs + sysupgrade, no LuCI, 8 MiB layout
+#                               # (always includes the ported WiFi driver;
+#                               # no diagnostic tools any more - CLAUDE.md section 8)
 #   ./build.sh --luci           # add LuCI (check the image still fits!)
+#   ./build.sh --slabinfo       # debug build: CONFIG_SLUB_DEBUG so /proc/slabinfo exists
 #   ./build.sh --flash 16       # ONLY if you confirmed a 16 MiB NOR chip
 #   ./build.sh --verbose        # make V=s, single job (for debugging failures)
 #   ./build.sh --clean          # wipe bin/ and build_dir before building
@@ -17,16 +20,36 @@ REPO_URL="https://github.com/ulli-kroll/openwrt.git"
 REPO_BRANCH="openwrt-siflower/v6.18/sf19/master"
 REPO_COMMIT="3dcbd9274bc1b065f9490645bae89c025b174e14"   # "add board support for banana pi wifi5"
 
+# The WiFi driver. Sources are NOT committed to this repo (no redistribution
+# grant - see CLAUDE.md section 4); they are cloned here and the port is applied
+# as driver/0001-*.patch. Pinned, because the patch is a context diff.
+DRIVER_URL="https://github.com/Siflower/sf_wifi.git"
+DRIVER_COMMIT="da991fafab179a2ed495c2925a0bf219ef38e22e"  # "Initial release for open-source wifi driver"
+
+# The LMAC firmware blobs come from an OLDER commit of the Banana Pi SDK, not
+# from sf_wifi: the memory-opt blobs in sf_wifi (and in the SDK's current
+# main) leave every fresh 5 GHz station without unicast for 2-25 s after
+# association; the build in this commit does not (measured 8/8 at 0.0 s,
+# same as the vendor firmware). Pinned by md5. See CLAUDE.md, "5 GHz
+# post-association blackout".
+LMAC_REPO_RAW="https://raw.githubusercontent.com/BPI-SINOVOIP/BPI-WiFi5-Siflower"
+LMAC_COMMIT="a685325502c3348690572ba64e18d2be65fe544a"
+LMAC_DIR="openwrt-18.06/package/kernel/sf_smac/config/a28fullmask/memory-opt"
+LMAC_HB_MD5="fdb7c5dfb665e0cb4cf30d4987fabb44"
+LMAC_LB_MD5="5842b583b20d7a8711d54209d2fbcc0d"
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/openwrt"
 FLASH_MB=8
 WITH_LUCI=0
+WITH_SLABINFO=0
 VERBOSE=0
 CLEAN=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--luci)    WITH_LUCI=1 ;;
+		--slabinfo) WITH_SLABINFO=1 ;;
 		--flash)   FLASH_MB="$2"; shift ;;
 		--verbose) VERBOSE=1 ;;
 		--clean)   CLEAN=1 ;;
@@ -74,6 +97,46 @@ for p in "$HERE"/patches/*.patch; do
 	git apply "$p" || die "patch failed: $p"
 done
 
+# ------------------------------------------------------------- wifi driver --
+# Rebuilds package/kernel/sf_smac from scratch every run: upstream sources at
+# the pinned commit, the port applied on top, plus the three headers the sf_wifi
+# repo does not ship and the OpenWrt package Makefile.
+say "Setting up the WiFi driver package"
+DRV_SRC="$HERE/sf_wifi"
+if [ ! -d "$DRV_SRC/.git" ]; then
+	git clone --single-branch "$DRIVER_URL" "$DRV_SRC"
+fi
+( cd "$DRV_SRC" && git fetch -q origin && git checkout -q --detach "$DRIVER_COMMIT" \
+	&& git reset -q --hard "$DRIVER_COMMIT" && git clean -qfd ) \
+	|| die "could not pin $DRIVER_URL to $DRIVER_COMMIT"
+
+PKG="$SRC/package/kernel/sf_smac"
+rm -rf "$PKG"
+mkdir -p "$PKG"
+cp -a "$DRV_SRC/sf_smac/src"    "$PKG/src"
+cp -a "$DRV_SRC/sf_smac/config" "$PKG/config"
+cp -a "$HERE/driver/siflower_include" "$PKG/"
+cp "$HERE/driver/sf_smac.Makefile" "$PKG/Makefile"
+cp "$HERE/driver/sf_factory_read.c" "$PKG/"
+cp -a "$HERE/driver/files" "$PKG/files"
+patch -p1 -s -d "$PKG/src" < "$HERE/driver/0001-sf_wifi-port-to-linux-6.18.patch" \
+	|| die "driver port patch failed"
+# the port must be there, or the build silently produces a 4.14 driver
+grep -q "timer_container_of" "$PKG/src/bb_src/umac/siwifi_utils.c" \
+	|| die "driver port did not apply cleanly"
+
+say "Fetching the LMAC firmware blobs (BPI SDK $LMAC_COMMIT)"
+mkdir -p "$HERE/dl"
+for f in sf1688_hb_fmac.bin sf1688_lb_fmac.bin; do
+	want=$LMAC_LB_MD5; [ "$f" = sf1688_hb_fmac.bin ] && want=$LMAC_HB_MD5
+	dst="$HERE/dl/lmac-${LMAC_COMMIT:0:7}-$f"
+	if [ ! -e "$dst" ] || [ "$(md5sum "$dst" | cut -d' ' -f1)" != "$want" ]; then
+		wget -q -O "$dst" "$LMAC_REPO_RAW/$LMAC_COMMIT/$LMAC_DIR/$f" || die "could not fetch $f"
+	fi
+	[ "$(md5sum "$dst" | cut -d' ' -f1)" = "$want" ] || die "$f: md5 mismatch"
+	cp "$dst" "$PKG/config/a28fullmask/memory-opt/$f"
+done
+
 if [ "$FLASH_MB" = 16 ]; then
 	say "Switching to 16 MiB NOR layout"
 	sed -i 's|reg = <0xa0000 0x760000>;.*|reg = <0xa0000 0xf60000>; /* 16 MiB NOR */|' \
@@ -100,25 +163,26 @@ CONFIG_TESTING_KERNEL=y
 CONFIG_TARGET_ROOTFS_INITRAMFS=y
 CONFIG_TARGET_ROOTFS_SQUASHFS=y
 CONFIG_PACKAGE_kmod-gpio-button-hotplug=y
-# --- diagnostics: reading hardware registers and sniffing the wire ---
-CONFIG_BUSYBOX_CUSTOM=y
-CONFIG_BUSYBOX_CONFIG_DEVMEM=y
-# /dev/mem itself, which OpenWrt disables by default - without this the
-# devmem applet exists but has nothing to open.
-CONFIG_KERNEL_DEVMEM=y
-CONFIG_PACKAGE_ethtool=y
-CONFIG_PACKAGE_tcpdump-mini=y
-CONFIG_PACKAGE_ip-full=y
-# read/write the AN8855 switch registers over MDIO (its regs are NOT
-# memory-mapped, so devmem cannot reach them)
-CONFIG_PACKAGE_mdio-tools=y
-CONFIG_PACKAGE_kmod-mdio-netlink=y
+# --- WiFi ---
+# hostapd-basic-mbedtls, not wpad: this board is only ever an access point, and
+# the AP-only binary is 159,744 bytes smaller in the image (measured).
+CONFIG_PACKAGE_kmod-sf_smac=y
+CONFIG_PACKAGE_kmod-cfg80211=y
+CONFIG_PACKAGE_hostapd-basic-mbedtls=y
+CONFIG_PACKAGE_iw=y
 EOF
 if [ "$WITH_LUCI" = 1 ]; then
 	cat >> .config <<'EOF'
 CONFIG_PACKAGE_luci=y
 CONFIG_PACKAGE_luci-ssl=y
 EOF
+fi
+if [ "$WITH_SLABINFO" = 1 ]; then
+	# Debug only. On 6.18 /proc/slabinfo is gated by CONFIG_SLUB_DEBUG; the
+	# runtime checks stay off unless slab_debug= is on the kernel command line.
+	# It changes the kernel config, so out-of-tree modules must be rebuilt
+	# against it (CLAUDE.md section 12, "Stale out-of-tree modules").
+	echo "CONFIG_KERNEL_SLUB_DEBUG=y" >> .config
 fi
 make defconfig >/dev/null
 

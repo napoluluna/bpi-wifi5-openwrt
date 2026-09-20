@@ -1,0 +1,88 @@
+#!/bin/sh
+# sf-thermal - RF temperature watchdog for the Siflower SF19A2890 radios.
+#
+# The only temperature sensor on this SoC is inside the RF block; the driver
+# exposes it in debugfs. Nothing in a mainline build acts on it. This polls it
+# and, when the RF die gets hot, throttles transmit duty cycle through the
+# driver's own tx_ctrl knob (TX descriptors withheld from the hardware queues,
+# 0..63; 64 also drops to one antenna), and turns A-MSDU aggregation off at the
+# higher levels. Same idea and same default thresholds as the vendor's closed
+# "temp" daemon (100 / 95 / 110 degC); written from scratch.
+#
+# Settings: /etc/config/sf_thermal. Log: logread -e sf-thermal
+
+. /lib/functions.sh
+
+TEMP=/sys/kernel/debug/aetnensis/temperature
+PARAMS=/sys/module/sf16a18_fmac/parameters
+# TX descriptors withheld (of 64) per level 0..5, and the critical level.
+# Measured 2026-09-19 on the 12 V supply, TCP download, share of full speed
+# (2.4 GHz HT20 = 100 Mbit/s, 5 GHz VHT80 = 200 Mbit/s unthrottled):
+#   value   32    48    56    60    62    63    64 (= 63 + one antenna)
+#   2.4 G   97 %  83 %  65 %  50 %  36 %  20 %  20 %
+#   5 G     80 %  59 %  48 %  33 %  20 %  10 %  10 %
+# These depend on the aggregation depth; re-measure if the LMAC or the TXQ
+# credit handling changes.
+STEPS="0 48 56 60 62 63"
+CRIT_DEC=64
+
+enabled=1 upper=100 lower=95 critical=110 interval=30
+load() {
+	config_load sf_thermal
+	config_get enabled  main enabled  1
+	config_get upper    main upper    100
+	config_get lower    main lower    95
+	config_get critical main critical 110
+	config_get interval main interval 30
+}
+
+step() { local n=$1; set -- $STEPS; shift "$n"; echo "$1"; }
+
+amsdu_lb= amsdu_hb=
+apply() {	# $1 = level (0..5, 6 = critical)
+	local dec f
+	if [ "$1" -ge 6 ]; then dec=$CRIT_DEC; else dec=$(step "$1"); fi
+	for f in /sys/kernel/debug/ieee80211/phy*/siwifi/throughput_ctrl/tx_ctrl; do
+		[ -w "$f" ] || continue
+		[ "$(cat "$f" 2>/dev/null)" = "$dec" ] || echo "$dec" > "$f"
+	done
+	[ -w "$PARAMS/amsdu_maxnb_lb" ] || return
+	if [ "$1" -ge 3 ]; then
+		[ -n "$amsdu_lb" ] || {
+			amsdu_lb=$(cat $PARAMS/amsdu_maxnb_lb)
+			amsdu_hb=$(cat $PARAMS/amsdu_maxnb_hb)
+		}
+		echo 1 > $PARAMS/amsdu_maxnb_lb; echo 1 > $PARAMS/amsdu_maxnb_hb
+	elif [ -n "$amsdu_lb" ]; then
+		echo "$amsdu_lb" > $PARAMS/amsdu_maxnb_lb
+		echo "$amsdu_hb" > $PARAMS/amsdu_maxnb_hb
+		amsdu_lb= amsdu_hb=
+	fi
+}
+
+load
+[ "$enabled" = 1 ] || { logger -t sf-thermal "disabled in /etc/config/sf_thermal"; exec sleep 2147483647; }
+logger -t sf-thermal "watching $TEMP: throttle >= ${upper}C, release <= ${lower}C, critical >= ${critical}C, every ${interval}s"
+
+trap 'apply 0; exit 0' TERM INT
+level=0
+while :; do
+	t=$(cat $TEMP 2>/dev/null)
+	case "$t" in
+	''|*[!0-9-]*) ;;			# radios down / no reading
+	*)
+		new=$level
+		if [ "$t" -le -50 ]; then :	# driver's "no band running" values
+		elif [ "$t" -ge "$critical" ]; then new=6
+		elif [ "$t" -ge "$upper" ]; then [ "$level" -lt 5 ] && new=$((level + 1))
+		elif [ "$t" -le "$lower" ]; then new=0
+		fi
+		if [ "$new" != "$level" ]; then
+			logger -t sf-thermal "RF ${t}C: level $level -> $new"
+			level=$new
+		fi
+		apply "$level"			# also re-applies after a wifi restart
+		;;
+	esac
+	sleep "$interval" & wait $!
+done
