@@ -278,7 +278,7 @@ than byte-identical.
 
 ## Limitations
 
-- **The status LED is blue.** The vendor firmware drives it red. The driver's
+- **The status LED is red.** The vendor firmware drives it blue. The driver's
   LED support (`CONFIG_SF19A28_WIFI_LED`, `siwifi_led.c`) is not built here.
 - **Three SSIDs per band**, fixed by the firmware blob layout the package is
   built against.
